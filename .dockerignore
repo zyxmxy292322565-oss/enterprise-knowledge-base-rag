@@ -1,0 +1,31 @@
+# Local environments and editor state
+venv/
+.venv/
+.idea/
+.git/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Never bake credentials into the image; pass them at runtime.
+.env
+.env.*
+
+# Local documents, archives, and temporary outputs are not runtime code.
+*.pdf
+*.zip
+*.log
+*.tmp
+*.temp
+*.swp
+*~
+
+# Keep the three files needed to restore the current FAISS knowledge index;
+# ignore any unrelated or temporary files under cache/.
+cache/*
+!cache/all_docs_*.pkl
+!cache/vectors_*.pkl
+!cache/faiss_index_*.index
