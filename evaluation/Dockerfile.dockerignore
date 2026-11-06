@@ -1,6 +1,0 @@
-**
-!*.py
-!requirements.txt
-!evaluation/
-!evaluation/Dockerfile
-!evaluation/evaluation_app.py
