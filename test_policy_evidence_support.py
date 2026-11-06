@@ -66,7 +66,7 @@ class SupportHTTPTests(unittest.TestCase):
     def test_low_but_passing_score_relevant_remains_usable(self):
         r,cache=self.query('AirPods Pro 2无理由退货的申请期限是什么？')
         self.assertEqual(r['code'],'SUCCESS');self.assertTrue(r['evidence_assessment']['sufficient_for_answer'])
-        self.assertTrue(r['evidence']);self.assertIn('lexical-support-v1',cache.call_args.kwargs['key'])
+        self.assertTrue(r['evidence']);cache.assert_not_called()
     def test_reranker_fault_is_not_business_refusal(self):
         r,_=self.query('AirPods退货政策是什么？',error=True)
         self.assertFalse(r['success']);self.assertEqual(r['code'],'RAG_QUERY_FAILED')

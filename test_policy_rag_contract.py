@@ -19,6 +19,15 @@ from policy_evidence_support import POLICY_EVIDENCE_CACHE_VERSION
 
 
 class PolicyRAGContractTests(unittest.TestCase):
+    def setUp(self):
+        # This suite exercises mock-backed legacy routes. The live host's
+        # acceptance write gate is verified independently.
+        self.enterContext(patch.dict(os.environ, {"RAG_V2_AUDIT_READONLY": "0"}))
+
+    def admin_client(self):
+        self.enterContext(patch.dict(os.environ, {"RAG_V2_ADMIN_TOKEN": "fixture"}))
+        return TestClient(api_app.app, headers={"X-RAG-V2-Token": "fixture"})
+
     def test_document_catalog_persists_management_metadata(self):
         cursor = MagicMock()
         connection = MagicMock()
@@ -61,7 +70,7 @@ class PolicyRAGContractTests(unittest.TestCase):
              patch.object(api_app, "save_document_records") as save_documents, \
              patch.object(api_app, "invalidate_rag_query_cache", return_value=4) as clear_cache:
             api_app.app.state.embed_model.encode.return_value = np.array([[0.1, 0.2]], dtype=np.float32)
-            response = TestClient(api_app.app).post(
+            response = self.admin_client().post(
                 "/upload",
                 files={"file": ("earphone.txt", "耳机类质量问题 30 天内可申请售后".encode("utf-8"), "text/plain")},
                 data={"category": "product_policy", "product_scope": "earphone", "version": "2026.10", "created_by": "admin_workbench"},
@@ -81,7 +90,7 @@ class PolicyRAGContractTests(unittest.TestCase):
              patch.object(api_app, "rebuild_faiss_index_from_docs", return_value={"index_count": 3}) as rebuild, \
              patch.object(api_app, "delete_document_record_by_hash", return_value=1), \
              patch.object(api_app, "invalidate_rag_query_cache", return_value=2) as clear_cache:
-            response = TestClient(api_app.app).delete("/documents/hash-delete")
+            response = self.admin_client().delete("/documents/hash-delete")
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["success"])
@@ -137,7 +146,7 @@ class PolicyRAGContractTests(unittest.TestCase):
              patch.object(api_app, "save_cache") as save_index, \
              patch.object(api_app, "save_document_records") as save_document, \
              patch.object(api_app, "delete_document_record_by_hash", return_value=1) as delete_document:
-            client = TestClient(api_app.app)
+            client = self.admin_client()
             uploaded = client.post("/upload", files={"file": ("test_policy.txt", file_bytes, "text/plain")})
             self.assertTrue(uploaded.json()["success"])
             self.assertNotIn(cache_key, cache)
@@ -146,7 +155,7 @@ class PolicyRAGContractTests(unittest.TestCase):
             self.assertTrue(first["success"])
             self.assertFalse(first["cache_hit"])
             self.assertIn("test_policy.txt", [item["source"] for item in first["evidence"]])
-            self.assertIn(cache_key, cache)
+            self.assertNotIn(cache_key, cache)
             deleted = client.delete(f"/documents/{file_hash}").json()
             self.assertTrue(deleted["success"])
             self.assertEqual(deleted["deleted_chunk_count"], 1)
@@ -200,7 +209,7 @@ class PolicyRAGContractTests(unittest.TestCase):
         self.assertEqual(payload["evidence"][0]["source"], "returns.md")
         self.assertEqual(payload["evidence"][0]["content"], document.page_content)
         self.assertIn("total_ms", payload["timing"])
-        set_cache.assert_called_once()
+        set_cache.assert_not_called()
 
     def test_query_version_metadata_compatibility_and_conflict(self):
         """An in-memory FAISS index exercises the real /rag/query response path."""
@@ -239,7 +248,7 @@ class PolicyRAGContractTests(unittest.TestCase):
                     self.assertEqual(result["evidence"][0]["version"], expected_version)
                     self.assertEqual(result["evidence"][0]["source"], "earphone.txt")
                     self.assertEqual(result["evidence"][0]["file_hash"], "known-hash")
-                    set_cache.assert_called_once()
+                    set_cache.assert_not_called()
                 else:
                     self.assertFalse(result["success"])
                     self.assertTrue(result["refused"])
@@ -280,33 +289,63 @@ class PolicyRAGContractTests(unittest.TestCase):
 
 
 class RedisConfigurationTests(unittest.TestCase):
+    # These tests isolate constructor parameter forwarding. Deployment target
+    # rejection is exercised separately in test_config_isolation.
+
+    @patch("redis_utils.require_target")
     @patch("redis_utils.redis.Redis")
-    def test_password_is_forwarded_without_changing_existing_parameters(self, redis_constructor):
+    def test_password_is_forwarded_without_changing_existing_parameters(self, redis_constructor, target_guard):
         with patch.dict(os.environ, {
             "REDIS_HOST": "redis",
             "REDIS_PORT": "6380",
             "REDIS_DB": "1",
             "REDIS_PASSWORD": "test-password",
+            "RAG_V2_REDIS_IDENTITY": "fixture-identity",
         }):
-            redis_utils.get_redis_client()
+            probe, raw = MagicMock(), MagicMock()
+            probe.get.return_value = "fixture-identity"
+            redis_constructor.side_effect = [probe, raw]
+            client = redis_utils.get_redis_client()
+            self.assertIs(client._raw, raw)
+            target_guard.assert_called_once_with("redis")
+            probe.get.assert_called_once_with(os.environ["RAG_V2_REDIS_PREFIX"] + "instance:identity")
+            probe.close.assert_called_once()
+            raw.close.assert_not_called()
+            client.get("forwarding-probe")
+            raw.get.assert_called_once_with(os.environ["RAG_V2_REDIS_PREFIX"] + "forwarding-probe")
 
-        self.assertEqual(redis_constructor.call_args.kwargs, {
+        arguments = dict(redis_constructor.call_args.kwargs)
+        self.assertEqual(arguments.pop("retry").get_retries(), 0)
+        self.assertEqual(arguments, {
             "host": "redis",
             "port": 6380,
             "db": 1,
             "decode_responses": True,
             "password": "test-password",
+            "socket_connect_timeout": 4, "socket_timeout": 4,
         })
 
+    @patch("redis_utils.require_target")
     @patch("redis_utils.redis.Redis")
-    def test_missing_password_preserves_no_auth_configuration(self, redis_constructor):
+    def test_missing_password_preserves_no_auth_configuration(self, redis_constructor, target_guard):
         with patch.dict(os.environ, {
             "REDIS_HOST": "localhost",
             "REDIS_PORT": "6379",
             "REDIS_DB": "0",
             "REDIS_PASSWORD": "",
+            "RAG_V2_REDIS_IDENTITY": "fixture-identity",
         }):
-            redis_utils.get_redis_client()
+            probe, raw = MagicMock(), MagicMock()
+            probe.get.return_value = "fixture-identity"
+            redis_constructor.side_effect = [probe, raw]
+            client = redis_utils.get_redis_client()
+            self.assertIs(client._raw, raw)
+            target_guard.assert_called_once_with("redis")
+            probe.get.assert_called_once_with(os.environ["RAG_V2_REDIS_PREFIX"] + "instance:identity")
+            probe.close.assert_called_once()
+            raw.close.assert_not_called()
+            client.get("forwarding-probe")
+            raw.get.assert_called_once_with(os.environ["RAG_V2_REDIS_PREFIX"] + "forwarding-probe")
 
         self.assertNotIn("password", redis_constructor.call_args.kwargs)
         self.assertEqual(redis_constructor.call_args.kwargs["db"], 0)

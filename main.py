@@ -9,14 +9,42 @@ from dotenv import load_dotenv
 # 基础配置
 # ===============================
 
-load_dotenv()
+from isolated_config import require_target
+require_target("mysql")
+require_target("redis")
 
-API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
+API_BASE = os.environ["API_BASE"]
 
 st.set_page_config(
     page_title="RAG 企业级知识库问答系统",
     layout="wide"
 )
+
+if os.getenv("RAG_V2_ENABLED") == "1":
+    options = ["现有 RAG", "V2 数据中台", "V2 评测中台", "V2 检索调试"]
+    if os.getenv("RAG_V3_GRAPH_ENABLED") == "1":
+        options.append("V3 知识图谱")
+    workspace = st.sidebar.radio("工作区", options, index=1)
+    if workspace == "V3 知识图谱":
+        from graph_ui import render_graph
+
+        render_graph(API_BASE)
+        st.stop()
+    if workspace == "V2 检索调试":
+        from retrieval_ui import render_debug
+
+        render_debug(API_BASE, os.getenv("RAG_V2_ADMIN_TOKEN", ""))
+        st.stop()
+    if workspace == "V2 评测中台":
+        from eval_center_ui import render_evaluation_center
+
+        render_evaluation_center(API_BASE, os.getenv("RAG_V2_ADMIN_TOKEN", ""))
+        st.stop()
+    if workspace == "V2 数据中台":
+        from knowledge_v2_ui import render_knowledge_center
+
+        render_knowledge_center(API_BASE, os.getenv("RAG_V2_ADMIN_TOKEN", ""))
+        st.stop()
 
 # ------------------------------
 # session_state 初始化
@@ -98,7 +126,7 @@ def safe_post(path: str, json_data: dict = None, timeout: int = 60):
     except Exception as e:
         return None, str(e)
 
-def safe_delete(endpoint: str):
+def safe_delete(endpoint: str, *, headers=None):
     """
     调用 FastAPI DELETE 接口。
     endpoint 示例：/qa_logs/1
@@ -106,6 +134,7 @@ def safe_delete(endpoint: str):
     try:
         response = requests.delete(
             f"{API_BASE}{endpoint}",
+            headers=headers,
             timeout=30
         )
         response.raise_for_status()
@@ -994,6 +1023,7 @@ if uploaded_file is not None:
             with st.spinner("正在上传、解析、切块、向量化并更新索引..."):
                 resp = requests.post(
                     f"{API_BASE}/upload",
+                    headers={"X-RAG-V2-Token": os.getenv("RAG_V2_ADMIN_TOKEN", "")},
                     files=files,
                     timeout=120
                 )
@@ -2242,7 +2272,8 @@ else:
                     st.warning("请先勾选确认删除。")
                 else:
                     delete_data, delete_error = safe_delete(
-                        f"/documents/{file_hash}"
+                        f"/documents/{file_hash}",
+                        headers={"X-RAG-V2-Token": os.getenv("RAG_V2_ADMIN_TOKEN", "")},
                     )
 
                     if delete_error:

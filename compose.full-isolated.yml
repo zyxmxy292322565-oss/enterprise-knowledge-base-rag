@@ -1,0 +1,93 @@
+name: ragv3app20261106
+services:
+  mysql:
+    image: mysql:8.4
+    command: [mysqld, --port=43317, --bind-address=0.0.0.0]
+    environment:
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql_root
+      MYSQL_DATABASE: ${RAG_DOCKER_DATABASE:?required}
+      MYSQL_USER: rag_docker_app
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql_app
+    ports: ['127.0.0.1:43327:43317']
+    volumes:
+      - mysql:/var/lib/mysql
+      - ${RAG_DOCKER_RESOURCE:?required}/secrets/mysql_root:/run/secrets/mysql_root:ro
+      - ${RAG_DOCKER_RESOURCE:?required}/secrets/mysql_app:/run/secrets/mysql_app:ro
+    healthcheck:
+      test: [CMD, mysqladmin, --protocol=tcp, --host=127.0.0.1, --port=43317, ping]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+  redis:
+    image: redis:8.4
+    command: [redis-server, /run/secrets/redis.conf]
+    ports: ['127.0.0.1:46407:46397']
+    volumes:
+      - redis:/data
+      - ${RAG_DOCKER_RESOURCE:?required}/secrets/redis.conf:/run/secrets/redis.conf:ro
+    healthcheck:
+      test: [CMD-SHELL, 'redis-cli -p 46397 ping 2>&1 | grep -q NOAUTH']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+  api:
+    image: ${RAG_DOCKER_APP_IMAGE:-rag-v3-full-clean-cpu:20261106}
+    build:
+      context: .
+      dockerfile: Dockerfile.full
+      args:
+        BASE_IMAGE: ${RAG_DOCKER_BASE_IMAGE:-python:3.11-slim}
+        REUSE_DEPENDENCIES: ${RAG_DOCKER_REUSE_DEPS:-0}
+    ports: ['127.0.0.1:18631:8000']
+    volumes:
+      - ${RAG_DOCKER_RESOURCE:?required}/runtime:/data
+      - ${RAG_DOCKER_RESOURCE:?required}/secrets/identity.json:/run/secrets/identity.json:ro
+      - ${RAG_DOCKER_RESOURCE:?required}/secrets/environment.json:/run/secrets/environment.json:ro
+      - ${RAG_DOCKER_RESOURCE:?required}/secrets/models.json:/run/secrets/models.json:ro
+      - ${RAG_DOCKER_EMBED:?required}:/models/embed:ro
+      - ${RAG_DOCKER_RERANK:?required}:/models/rerank:ro
+      - ${RAG_DOCKER_COST_DIR:?required}:/cost
+      - ${RAG_DOCKER_RESOURCE:?required}/evaluation-history:/app/evaluation:ro
+    networks: [default, milvus]
+    depends_on:
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, 'import json,urllib.request; assert json.load(urllib.request.urlopen("http://127.0.0.1:8000/system/health",timeout=8))["success"]']
+      interval: 15s
+      timeout: 6s
+      start_period: 120s
+      retries: 15
+    restart: unless-stopped
+  ui:
+    image: ${RAG_DOCKER_APP_IMAGE:-rag-v3-full-clean-cpu:20261106}
+    command: [python, -m, deployment.ui]
+    ports: ['127.0.0.1:18632:8501']
+    volumes:
+      - ${RAG_DOCKER_RESOURCE:?required}/runtime:/data
+      - ${RAG_DOCKER_RESOURCE:?required}/secrets/identity.json:/run/secrets/identity.json:ro
+      - ${RAG_DOCKER_RESOURCE:?required}/secrets/environment.json:/run/secrets/environment.json:ro
+      - ${RAG_DOCKER_RESOURCE:?required}/secrets/models.json:/run/secrets/models.json:ro
+      - ${RAG_DOCKER_EMBED:?required}:/models/embed:ro
+      - ${RAG_DOCKER_RERANK:?required}:/models/rerank:ro
+      - ${RAG_DOCKER_COST_DIR:?required}:/cost
+      - ${RAG_DOCKER_RESOURCE:?required}/evaluation-history:/app/evaluation:ro
+    networks: [default, milvus]
+    depends_on:
+      api: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8501/_stcore/health",timeout=4)']
+      interval: 15s
+      timeout: 6s
+      retries: 10
+    restart: unless-stopped
+volumes:
+  mysql: {}
+  redis: {}
+networks:
+  default: {}
+  milvus:
+    external: true
+    name: ragv3milvus20261105_default

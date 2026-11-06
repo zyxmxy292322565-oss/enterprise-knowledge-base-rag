@@ -64,15 +64,15 @@ class EvaluationCoreTests(unittest.TestCase):
         self.assertEqual(trace['used_indices'], [0])
         self.assertIsNone(trace['ranked_candidates'][0]['rerank_score'])
 
-    def test_public_route_defaults_and_cache_path(self):
+    def test_public_route_defaults_and_legacy_cache_bypass(self):
         with patch.object(api_app.app.state, 'all_docs', self.docs, create=True), \
              patch.object(api_app.app.state, 'vectors', np.ones((2, 2)), create=True), \
              patch.object(api_app.app.state, 'index', self.index, create=True), \
              patch.object(api_app, 'get_cache', return_value={'answer': 'cached', 'sources': []}) as read, \
              patch.object(api_app, 'incr_cache_stat'), patch.object(api_app, 'save_rag_request_log'):
             result = api_app.ask_question(api_app.AskRequest(question='问题'))
-        read.assert_called_once()
-        self.assertTrue(result['from_cache'])
+        read.assert_not_called()
+        self.assertFalse(result.get('from_cache', False))
         self.assertEqual(api_app.AskRequest(question='x').top_k, 3)
         self.assertEqual(api_app.PolicyRAGRequest(question='x').faiss_multiplier, 3)
 
@@ -156,6 +156,7 @@ class EvaluationStorageTests(unittest.TestCase):
         manifest = {'index_files_sha256': {'index': 'digest'}}
         with patch.object(module, '_execute', side_effect=execute), \
              patch.object(module, 'snapshot_manifest', return_value=manifest), \
+             patch.object(module.api_app.app.state, 'chat_model', SimpleNamespace(last_call={}), create=True), \
              patch.object(module.api_app, '_ask_question', side_effect=ask):
             experiment = module.create_experiment(module.ExperimentRequest(dataset_version='reviewed-v1'))
             run = module.create_run(experiment['experiment_id'])

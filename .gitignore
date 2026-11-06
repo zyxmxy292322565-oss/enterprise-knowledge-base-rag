@@ -41,3 +41,6 @@ evaluation/experiments/**/probe_record.json
 evaluation/experiments/**/first_call_probe.json
 evaluation/experiments/**/document_upload_results.json
 policy_docs/
+
+.isolation/
+isolated.json

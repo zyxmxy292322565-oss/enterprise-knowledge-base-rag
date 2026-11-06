@@ -1,11 +1,13 @@
 import os
 import json
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 from dotenv import load_dotenv
 from cache_utils import RAG_QUERY_CACHE_PREFIX
 
 
-load_dotenv()
+from isolated_config import require_target
 
 
 def get_redis_client():
@@ -15,27 +17,35 @@ def get_redis_client():
     REDIS_HOST=redis
     REDIS_PORT=6379
     """
+    require_target("redis")
     connection_kwargs = dict(
-        host=os.getenv("REDIS_HOST", "localhost"),
-        port=int(os.getenv("REDIS_PORT", 6379)),
-        db=int(os.getenv("REDIS_DB", 0)),
-        decode_responses=True
+        host=os.environ["REDIS_HOST"],
+        port=int(os.environ["REDIS_PORT"]),
+        db=int(os.environ["REDIS_DB"]),
+        decode_responses=True,
+        socket_connect_timeout=4,
+        socket_timeout=4,
+        retry=Retry(NoBackoff(), 0),
     )
     password = os.getenv("REDIS_PASSWORD")
     if password:
         connection_kwargs["password"] = password
 
-    client = redis.Redis(**connection_kwargs)
-
-    return client
+    probe = redis.Redis(**connection_kwargs)
+    try:
+        identity=probe.get(os.environ['RAG_V2_REDIS_PREFIX']+'instance:identity')
+        if identity != os.environ['RAG_V2_REDIS_IDENTITY']:raise RuntimeError('Connected Redis identity mismatch')
+    finally:probe.close()
+    from redis_namespace import NamespacedRedis
+    return NamespacedRedis(redis.Redis(**connection_kwargs),os.environ['RAG_V2_REDIS_PREFIX'],identity)
 
 
 def check_redis_connection():
     """
     测试 Redis 是否可用。
     """
-    client = get_redis_client()
-    return client.ping()
+    with get_redis_client() as client:
+        return client.ping()
 
 
 def get_cache(key: str):
@@ -55,10 +65,11 @@ def get_cache(key: str):
             return None
 
         try:
-            return json.loads(value)
+            decoded = json.loads(value)
+            return decoded if isinstance(decoded, dict) else None
 
-        except Exception:
-            return value
+        except (json.JSONDecodeError, TypeError):
+            return None
 
     except Exception as e:
 
