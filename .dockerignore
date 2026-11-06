@@ -36,9 +36,6 @@ rag-v3-runtime/
 *.swp
 *~
 
-# Keep the three files needed to restore the current FAISS knowledge index;
-# ignore any unrelated or temporary files under cache/.
-cache/*
-!cache/all_docs_*.pkl
-!cache/vectors_*.pkl
-!cache/faiss_index_*.index
+# Runtime assets are mounted separately.
+cache/
+evaluation/

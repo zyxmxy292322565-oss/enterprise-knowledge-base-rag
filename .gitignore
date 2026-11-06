@@ -28,7 +28,6 @@ node_modules/
 *.npz
 cache/
 .huggingface/
-docs/
 evaluation/snapshots/
 evaluation/datasets/
 evaluation/experiments/**/raw_*.jsonl
