@@ -8,7 +8,7 @@ services:
       MYSQL_DATABASE: ${RAG_DOCKER_DATABASE:?required}
       MYSQL_USER: rag_docker_app
       MYSQL_PASSWORD_FILE: /run/secrets/mysql_app
-    ports: ['127.0.0.1:43327:43317']
+    ports: ['127.0.0.1:${RAG_DOCKER_MYSQL_PORT:-43327}:43317']
     volumes:
       - mysql:/var/lib/mysql
       - ${RAG_DOCKER_RESOURCE:?required}/secrets/mysql_root:/run/secrets/mysql_root:ro
@@ -22,7 +22,7 @@ services:
   redis:
     image: redis:8.4
     command: [redis-server, /run/secrets/redis.conf]
-    ports: ['127.0.0.1:46407:46397']
+    ports: ['127.0.0.1:${RAG_DOCKER_REDIS_PORT:-46407}:46397']
     volumes:
       - redis:/data
       - ${RAG_DOCKER_RESOURCE:?required}/secrets/redis.conf:/run/secrets/redis.conf:ro
@@ -40,7 +40,7 @@ services:
       args:
         BASE_IMAGE: ${RAG_DOCKER_BASE_IMAGE:-python:3.11-slim}
         REUSE_DEPENDENCIES: ${RAG_DOCKER_REUSE_DEPS:-0}
-    ports: ['127.0.0.1:18631:8000']
+    ports: ['127.0.0.1:${RAG_DOCKER_API_PORT:-18631}:8000']
     volumes:
       - ${RAG_DOCKER_RESOURCE:?required}/runtime:/data
       - ${RAG_DOCKER_RESOURCE:?required}/secrets/identity.json:/run/secrets/identity.json:ro
@@ -64,7 +64,7 @@ services:
   ui:
     image: ${RAG_DOCKER_APP_IMAGE:-rag-v3-full-clean-cpu:20261106}
     command: [python, -m, deployment.ui]
-    ports: ['127.0.0.1:18632:8501']
+    ports: ['127.0.0.1:${RAG_DOCKER_UI_PORT:-18632}:8501']
     volumes:
       - ${RAG_DOCKER_RESOURCE:?required}/runtime:/data
       - ${RAG_DOCKER_RESOURCE:?required}/secrets/identity.json:/run/secrets/identity.json:ro
@@ -90,4 +90,4 @@ networks:
   default: {}
   milvus:
     external: true
-    name: ragv3milvus20261105_default
+    name: ${RAG_DOCKER_MILVUS_NETWORK:-ragv3milvus20261105_default}

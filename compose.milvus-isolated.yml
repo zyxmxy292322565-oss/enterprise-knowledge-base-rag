@@ -36,7 +36,7 @@ services:
       MINIO_ACCESS_KEY_ID: ${RAG_MILVUS_MINIO_USER:?required}
       MINIO_SECRET_ACCESS_KEY: ${RAG_MILVUS_MINIO_PASSWORD:?required}
       MINIO_REGION: us-east-1
-    ports: ['127.0.0.1:19531:19530','127.0.0.1:19091:9091']
+    ports: ['127.0.0.1:${RAG_DOCKER_MILVUS_PORT:-19531}:19530','127.0.0.1:${RAG_DOCKER_MILVUS_HEALTH_PORT:-19091}:9091']
     volumes: [milvus:/var/lib/milvus]
     healthcheck:
       test: [CMD, curl, -f, http://localhost:9091/healthz]

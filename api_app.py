@@ -538,8 +538,12 @@ def system_health():
     has_rerank_model = hasattr(app.state, "rerank_model")
     has_chat_model = hasattr(app.state, "chat_model")
 
+    # A fresh knowledge store can accept uploads before it has a published index.
+    empty_knowledge = _knowledge() is not None and view.snapshot_id is None
+    models_ready = has_embed_model and has_rerank_model and has_chat_model
     rag_status = {
-        "ok": has_index and has_vectors and has_embed_model and has_rerank_model and has_chat_model,
+        "ok": models_ready and (empty_knowledge or (has_index and has_vectors)),
+        "ready_for_queries": models_ready and has_index and has_vectors,
         "doc_count": doc_count,
         "index_count": index_count,
         "has_index": has_index,

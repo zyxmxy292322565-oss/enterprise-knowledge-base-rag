@@ -9,5 +9,6 @@ RUN if [ "$REUSE_DEPENDENCIES" != "1" ]; then \
     fi && pip install --no-cache-dir pymilvus==2.6.17
 COPY *.py ./
 COPY deployment/ ./deployment/
+COPY migrations/ ./migrations/
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 RAG_DEPLOYMENT_MODE=docker
 CMD ["uvicorn", "deployment.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]

@@ -44,3 +44,10 @@ policy_docs/
 
 .isolation/
 isolated.json
+*.dpapi
+*.safetensors
+pytorch_model*.bin
+compose.env
+secrets/
+rag-v3-runtime/
+rag-models/

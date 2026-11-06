@@ -4,3 +4,5 @@
 !*.py
 !deployment/
 !deployment/*.py
+!migrations/
+!migrations/*.sql
