@@ -1,8 +1,53 @@
 from pathlib import Path
 from unittest import TestCase
+from unittest.mock import Mock
 
+from pydantic import ValidationError
+
+from eval_center_api import RunConfig, validate_draft_dataset
 from eval_center_data import historical_dataset
 from eval_center_metrics import answer_metrics, covered_span, ranking, retrieval_metrics, summarize
+from eval_center_runner import load_evaluation_snapshot
+from knowledge_v2 import KnowledgeError
+
+
+class DraftEvaluationTests(TestCase):
+    def setUp(self):
+        self.spec = dict(dataset_id="dataset", dataset_version="v1", corpus_snapshot_id="corpus",
+                         index_snapshot_id="snapshot", publish_generation=0, snapshot_mode="draft_validation",
+                         mode="retrieval", candidate_k=8, final_k=3)
+
+    def test_generation_zero_is_exclusive_to_draft_validation_and_graph_stays_disabled(self):
+        self.assertEqual(RunConfig(**self.spec).publish_generation, 0)
+        self.assertEqual(RunConfig(**(self.spec | {"snapshot_mode": "published", "publish_generation": 1})).snapshot_mode,
+                         "published")
+        for changes in ({"snapshot_mode": "published"}, {"publish_generation": 1}, {"graph_enabled": True}):
+            with self.subTest(changes=changes), self.assertRaises(ValidationError):
+                RunConfig(**(self.spec | changes))
+
+    def test_draft_requires_bound_validation_dataset_with_reviewed_evidence(self):
+        reviewed = {"review_status": "developer_self_reviewed"}
+        row = {"split": "validation", "body": {"provenance": {"snapshot_id": "snapshot"},
+               "questions": [reviewed], "evidence": [reviewed]}}
+        validate_draft_dataset(row, "snapshot")
+        for change in ({"split": "holdout"}, {"body": row["body"] | {"evidence": [
+                {"review_status": "proposed_unreviewed"}]}}):
+            with self.subTest(change=change), self.assertRaises(KnowledgeError):
+                validate_draft_dataset(row | change, "snapshot")
+        with self.assertRaises(KnowledgeError):
+            validate_draft_dataset(row, "another")
+
+    def test_draft_worker_rejects_changed_manifest_before_load(self):
+        store = Mock()
+        store.snapshot_status.return_value = {"manifest_sha": "original"}
+        config = self.spec | {"snapshot_manifest_sha256": "original"}
+        self.assertIs(load_evaluation_snapshot(store, config), store.load_snapshot.return_value)
+        store.load_snapshot.assert_called_once_with("snapshot", strict_sparse=True)
+        store.load_snapshot.reset_mock()
+        store.snapshot_status.return_value = {"manifest_sha": "changed"}
+        with self.assertRaises(KnowledgeError):
+            load_evaluation_snapshot(store, config)
+        store.load_snapshot.assert_not_called()
 
 
 class EvaluationMetricsTests(TestCase):

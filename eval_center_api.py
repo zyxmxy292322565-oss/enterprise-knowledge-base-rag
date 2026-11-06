@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from eval_center_data import Evidence, Question, historical_dataset, map_anchor
 from eval_center_metrics import FAILURES, answer_metrics, semantic_failures
-from eval_center_runner import capture, start_run
+from eval_center_runner import capture, load_evaluation_snapshot, start_run
 from eval_center_store import SPLITS, audit, case, compare, dataset, now, packed, review_entity, run, validated_body
 from knowledge_v2 import KnowledgeError
 from knowledge_v2_api import _store
@@ -306,6 +306,13 @@ def mappings(dataset_id: str, version: str, snapshot_id: str, question_id: str |
     return checked(operation)
 
 
+class SemanticRunOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    model_router: bool = False
+    timeout_budget_ms: int = Field(default=5000, ge=50, le=60000)
+    token_budget: int = Field(default=4096, ge=128, le=65536)
+
+
 class RunConfig(RetrievalConfig):
     reliability_enabled: bool = False
     reliability_validator: Literal["rules", "semantic"] = "rules"
@@ -314,7 +321,9 @@ class RunConfig(RetrievalConfig):
     dataset_version: str
     corpus_snapshot_id: str
     index_snapshot_id: str
-    publish_generation: int = Field(gt=0)
+    snapshot_mode: Literal["published", "draft_validation"] = "published"
+    publish_generation: int = Field(ge=0)
+    semantic_options: SemanticRunOptions | None = None
     mode: Literal["retrieval", "answer"]
     candidate_k: int = Field(ge=1, le=200)
     final_k: int = Field(ge=1, le=50)
@@ -323,6 +332,12 @@ class RunConfig(RetrievalConfig):
 
     @model_validator(mode="after")
     def valid_k(self):
+        if (self.publish_generation == 0) != (self.snapshot_mode == "draft_validation"):
+            raise ValueError("Draft validation requires generation 0; published runs require a publication")
+        if self.snapshot_mode == "draft_validation" and self.graph_enabled:
+            raise ValueError("Draft validation cannot query the graph")
+        if self.semantic_options is not None and self.reliability_validator != "semantic":
+            raise ValueError("Semantic run options require semantic validation")
         if self.reliability_validator == "semantic" and not self.reliability_enabled:
             raise ValueError("Semantic validation requires the reliability controller")
         if self.reliability_enabled and self.mode != "answer":
@@ -336,13 +351,36 @@ def exposed(record):
     return {k: v for k, v in record.items() if k not in {"inputs", "worker_id"}}
 
 
+def validate_draft_dataset(row, snapshot_id):
+    body = row["body"]
+    if (row["split"] != "validation" or body.get("provenance", {}).get("snapshot_id") != snapshot_id
+            or not body["questions"] or not body["evidence"]
+            or any(record["review_status"] != "developer_self_reviewed"
+                   for collection in ("questions", "evidence") for record in body[collection])):
+        raise KnowledgeError("Draft validation requires a bound, developer-reviewed validation dataset", 409)
+
+
 @router.post("/runs", status_code=201)
 def create_run(payload: RunConfig, store=Depends(_store), x_eval_holdout: str | None = Header(default=None)):
     from api_app import app
 
     def operation():
-        config = capture(store, app, payload.model_dump())
         key = payload.dataset_id, payload.dataset_version
+        options = payload.model_dump()
+        with store.transaction() as cursor:
+            row = dataset(cursor, key)
+            scope(row, x_eval_holdout)
+            if not row["frozen"]:
+                raise KnowledgeError("Freeze dataset version before creating a run", 409)
+        if payload.snapshot_mode == "draft_validation":
+            if payload.review_cohort != "developer":
+                raise KnowledgeError("Draft validation requires the developer cohort", 409)
+            validate_draft_dataset(row, payload.index_snapshot_id)
+        config = capture(store, app, options)
+        if payload.snapshot_mode == "draft_validation":
+            view = load_evaluation_snapshot(store, config)
+            if any(map_anchor(store, view, evidence)["status"] != "mapped" for evidence in row["body"]["evidence"]):
+                raise KnowledgeError("Draft validation requires every evidence anchor to map", 409)
         with store.transaction() as cursor:
             row = dataset(cursor, key, lock=True)
             scope(row, x_eval_holdout)

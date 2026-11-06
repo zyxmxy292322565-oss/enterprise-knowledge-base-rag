@@ -175,7 +175,7 @@ def compare(entries):
     configs = [r["config"] for r, _ in entries]
     shared_fields = ("dataset_id", "dataset_version", "dataset_sha256", "index_snapshot_id", "publish_generation",
                      "corpus_snapshot_id", "mode", "candidate_k", "final_k", "review_cohort", "reliability_enabled",
-                     "reliability_validator",
+                     "reliability_validator", "snapshot_mode", "snapshot_manifest_sha256", "semantic_options",
                      "working_code_sha256", "embedding_model_version", "rerank_model_version", "prompt_version")
     compatible = all(all(config.get(k) == configs[0].get(k) for k in shared_fields) for config in configs[1:])
     if not compatible:

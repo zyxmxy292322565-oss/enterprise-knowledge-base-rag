@@ -58,16 +58,30 @@ def runtime_identity(app):
     }
 
 
+def load_evaluation_snapshot(store, config):
+    snapshot_id = config["index_snapshot_id"]
+    if config.get("snapshot_mode") == "draft_validation":
+        if store.snapshot_status(snapshot_id)["manifest_sha"] != config["snapshot_manifest_sha256"]:
+            raise KnowledgeError("Draft manifest changed; create a new run", 409)
+        return store.load_snapshot(snapshot_id, strict_sparse=True)
+    return store.load_snapshot(snapshot_id, config["publish_generation"])
+
+
 def capture(store, app, options):
-    view = store.load_snapshot(options["index_snapshot_id"])
+    snapshot_id = options["index_snapshot_id"]
+    manifest_hash = store.snapshot_status(snapshot_id)["manifest_sha"]
+    options = options | {"snapshot_manifest_sha256": manifest_hash}
+    draft = options.get("snapshot_mode") == "draft_validation"
+    view = load_evaluation_snapshot(store, options)
     if view.corpus_snapshot_id != options["corpus_snapshot_id"]:
         raise KnowledgeError("Corpus snapshot does not match index snapshot", 409)
-    with store.transaction() as cursor:
-        cursor.execute("SELECT snapshot_id FROM rag_v2_publications WHERE publish_generation=%s",
-                       (options["publish_generation"],))
-        row = cursor.fetchone()
-        if not row or row["snapshot_id"] != view.snapshot_id:
-            raise KnowledgeError("Index and publish generation mismatch", 409)
+    if not draft:
+        with store.transaction() as cursor:
+            cursor.execute("SELECT snapshot_id FROM rag_v2_publications WHERE publish_generation=%s",
+                           (options["publish_generation"],))
+            row = cursor.fetchone()
+            if not row or row["snapshot_id"] != view.snapshot_id:
+                raise KnowledgeError("Index and publish generation mismatch", 409)
     return runtime_identity(app) | options | {
         "metrics_version": METRICS_VERSION, "cache_mode": "bypass",
         "vector_backend": "milvus" if getattr(view,"dense_binding",None) else "faiss",
@@ -118,11 +132,15 @@ def evaluate(store, view, cfg, question, evidence):
         from reliability import ReliabilityOptions, control
         from retrieval_engine import ChatTurn
         from semantic_reliability import run_semantic
+        settings = question.get("reliability_input", {}) | (cfg.get("semantic_options") or {})
+        if cfg.get("snapshot_mode") == "draft_validation":
+            settings = settings | {"graph_enabled": False}
         args = (store, view, question["question"],
                 [ChatTurn.model_validate(t) for t in question.get("chat_history", [])],
-                ReliabilityOptions.model_validate(question.get("reliability_input", {})), app.state.embed_model)
+                ReliabilityOptions.model_validate(settings), app.state.embed_model)
         semantic = cfg.get("reliability_validator") == "semantic"
-        result = run_semantic(*args) if semantic else control(*args, app.state.rerank_model)
+        result = (run_semantic(*args, reranker=app.state.rerank_model if cfg["rerank_enabled"] else None)
+                  if semantic else control(*args, app.state.rerank_model))
         from eval_center_metrics import ratio
         attempts = result["retrieval_attempts"]
         validation = result["evidence_validation"]
@@ -280,7 +298,7 @@ def execute(store, identifier):
             cursor.execute("SELECT question_id FROM rag_eval_center_cases WHERE run_id=%s", (identifier,))
             done = {r["question_id"] for r in cursor.fetchall()}
         cfg, inputs = record["config"], record["inputs"]
-        view = store.load_snapshot(cfg["index_snapshot_id"], cfg["publish_generation"])
+        view = load_evaluation_snapshot(store, cfg)
         for question in inputs["questions"]:
             qid = question["question_id"]
             if qid in done:
