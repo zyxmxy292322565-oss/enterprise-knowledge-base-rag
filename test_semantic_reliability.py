@@ -59,7 +59,7 @@ class SemanticTests(TestCase):
                 view.all_docs[0].metadata["version"] = "bad"
                 with self.assertRaises(ValueError):
                     evidence_for(store, view, 0)
-    def execute(self, responses, page_content=""):
+    def execute(self, responses, page_content="", question="可以申请退款吗？", quote="质量核验后可提出申请"):
         view = NS(snapshot_id="s", corpus_snapshot_id="c", generation=2)
         candidate = {"doc": NS(metadata={"child_id": "a"}, page_content=page_content), "faiss_index": 0}
         found = NS(candidates=[candidate], trace={})
@@ -72,10 +72,17 @@ class SemanticTests(TestCase):
         with patch.dict("os.environ", dict(RAG_V2_SEMANTIC_ENABLED="1", RAG_V2_SEMANTIC_GENERATOR="draft",
                 RAG_V2_SEMANTIC_JUDGE="judge", RAG_V2_SEMANTIC_BASE_URL="http://localhost",
                 RAG_V2_SEMANTIC_API_KEY="fixture")), patch("semantic_reliability.retrieve", return_value=found), \
-                patch("semantic_reliability.evidence_for", return_value={"quote": "质量核验后可提出申请"}):
-            result = run_semantic(None, view, "可以申请退款吗？", [], ReliabilityOptions(token_budget=65536), None,
+                patch("semantic_reliability.evidence_for", return_value={"quote": quote}):
+            result = run_semantic(None, view, question, [], ReliabilityOptions(token_budget=65536), None,
                                   client_factory=factory)
         return result, create
+
+    def test_unspecified_duration_is_abstention_not_a_supported_value(self):
+        answer, create = self.execute([], question="退款后最迟多少小时到账？",
+                                      quote="退款申请须在7天内提交。本政策未规定退款到账时间。")
+        self.assertEqual(answer["answer_action"], "ABSTAIN")
+        self.assertEqual(answer["evidence_validation"]["reason"], "requested_value_not_in_applicable_evidence")
+        create.assert_not_called()
 
     def test_reviewed_policy_condition_blocks_before_model(self):
         with patch("reliability.verified_rules", return_value=[("verified", "citation")]) as rules, \

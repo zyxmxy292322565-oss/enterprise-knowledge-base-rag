@@ -1,13 +1,36 @@
 import json
 import unittest
-from unittest.mock import patch
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from knowledge_graph import Assertion, Entity, conflicts_for, entity_id, extract
+from knowledge_graph import Assertion, Entity, _sealed_extraction, conflicts_for, entity_id, extract
+from knowledge_v2 import KnowledgeError
 from reliability import ReliabilityOptions, route
 from retrieval_engine import RetrievalConfig, fuse
 
 
 class KnowledgeGraphTests(unittest.TestCase):
+    def test_reuse_requires_identical_children_and_complete_sealed_journal(self):
+        manifest = {"members": [{"document_version_id": "v"}], "parents": [], "children": [{"child_id": "c"}]}
+        source = SimpleNamespace(snapshot_id="source", corpus_snapshot_id="corpus", manifest=manifest)
+        target = SimpleNamespace(snapshot_id="target", corpus_snapshot_id="corpus", manifest=manifest,
+                                 all_docs=[SimpleNamespace(metadata={"child_id": "c"})])
+        cursor = Mock()
+        cursor.fetchone.return_value = dict(task_status="SEALED", mode="llm", model="model",
+                                               prompt_version="prompt", schema_version="schema")
+        cursor.fetchall.return_value = [{"child_id": "c", "status": "DONE", "result": "[]"}]
+        store = SimpleNamespace(load_snapshot=Mock(return_value=source), transaction=lambda: nullcontext(cursor))
+        self.assertEqual(_sealed_extraction(store, target, "source", "schema"),
+                         (("llm", "replay:source:model", "prompt", "schema"), {"c": []}))
+        target.manifest = manifest | {"children": [{"child_id": "changed"}]}
+        with self.assertRaisesRegex(KnowledgeError, "identical"):
+            _sealed_extraction(store, target, "source", "schema")
+        target.manifest = manifest
+        cursor.fetchall.return_value[0]["status"] = "FAILED"
+        with self.assertRaisesRegex(KnowledgeError, "journal"):
+            _sealed_extraction(store, target, "source", "schema")
+
     def test_conflict_requires_same_conditions_and_overlapping_time(self):
         left = dict(relation_id="a", source_entity_id="product", target_entity_id="action",
                     relation_type="ALLOWS", polarity="affirmed", conditions=["quality"],

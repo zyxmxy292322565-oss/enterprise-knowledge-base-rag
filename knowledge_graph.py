@@ -77,12 +77,50 @@ def mutable(cursor, store, sid):
     return cursor.fetchone()
 
 
-def build(store, view, mode="rules", batch_size=100):
+def _sealed_extraction(store, view, source_id, expected_schema):
+    if source_id == view.snapshot_id:
+        raise KnowledgeError("Extraction source must be a different snapshot", 409)
+    source = store.load_snapshot(source_id, strict_sparse=True)
+    if (source.corpus_snapshot_id != view.corpus_snapshot_id or
+            any(source.manifest[key] != view.manifest[key] for key in ("members", "parents", "children"))):
+        raise KnowledgeError("Extraction reuse requires identical document and Child versions", 409)
+    with store.transaction() as c:
+        c.execute("""SELECT b.task_status,r.mode,r.model,r.prompt_version,r.schema_version
+                     FROM kg_builds b JOIN kg_extraction_runs r ON r.snapshot_id=b.snapshot_id
+                     WHERE b.snapshot_id=%s""", (source_id,))
+        run = c.fetchone()
+        if not run or (run["task_status"], run["mode"], run["schema_version"]) != ("SEALED", "llm", expected_schema):
+            raise KnowledgeError("Extraction reuse requires a sealed compatible model journal", 409)
+        c.execute("SELECT child_id,status,result FROM kg_extraction_chunks WHERE snapshot_id=%s", (source_id,))
+        rows = c.fetchall()
+    if ({r["child_id"] for r in rows} != {doc.metadata["child_id"] for doc in view.all_docs}
+            or any(r["status"] != "DONE" for r in rows)):
+        raise KnowledgeError("Extraction journal does not cover the target Children", 409)
+    assertions = {r["child_id"]: [Assertion.model_validate(item["assertion"]) for item in json.loads(r["result"])]
+                  for r in rows}
+    # Persist the source identity in the frozen run signature. A resume cannot
+    # swap in fresh model output or a different source.
+    model = run["model"].rsplit(":", 1)[-1] if run["model"].startswith("replay:") else run["model"]
+    signature = ("llm", f"replay:{source_id}:{model}", run["prompt_version"], expected_schema)
+    if len(signature[1]) > 150:
+        raise KnowledgeError("Extraction source identity exceeds the storage contract", 409)
+    return signature, assertions
+
+
+def build(store, view, mode="rules", batch_size=100, source_snapshot_id=None):
     from graph_extraction import PROMPT_VERSION, SCHEMA_VERSION, extract_llm, model_identity
 
     sid = view.snapshot_id
     signature = (mode, model_identity() if mode == "llm" else "rules-v1", PROMPT_VERSION, SCHEMA_VERSION)
-    if mode == "llm" and (os.getenv("RAG_V3_KG_LLM_ENABLED") != "1" or not signature[1]
+    if source_snapshot_id:
+        if mode != "llm":
+            raise KnowledgeError("Extraction reuse requires llm mode")
+        signature, assertions = _sealed_extraction(store, view, source_snapshot_id, SCHEMA_VERSION)
+
+        def extract_llm(quote, child_id):
+            return assertions[child_id]
+
+    elif mode == "llm" and (os.getenv("RAG_V3_KG_LLM_ENABLED") != "1" or not signature[1]
                           or not os.getenv("RAG_V3_KG_BASE_URL") or not os.getenv("RAG_V3_KG_API_KEY")):
         raise KnowledgeError("Extraction model not explicitly configured", 409)
     # MySQL advisory lock belongs to this connection and releases on process exit.

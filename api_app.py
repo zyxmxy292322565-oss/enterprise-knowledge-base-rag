@@ -28,7 +28,7 @@ from retrieval_debug import router as retrieval_debug_router
 from graph_api import router as graph_router
 from retrieval_engine import (RetrievalConfig, RetrievalRequest, expand_parents, hyde_generator,
                               identity as retrieval_identity, rescore, retrieve, subquery_gaps)
-from policy_evidence_support import assess_policy_support, POLICY_EVIDENCE_CACHE_VERSION
+from policy_evidence_support import assess_policy_support, select_policy_evidence, POLICY_EVIDENCE_CACHE_VERSION
 from redis_utils import get_cache, set_cache
 from fastapi import Depends, FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
@@ -1813,7 +1813,7 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
             advanced.trace["threshold"] = {"status": "used" if threshold_enabled and rerank_enabled else
                                             "unavailable" if threshold_enabled else "not_used",
                                             "mode": "per_evidence", "minimum": request.min_rerank_score}
-        accepted = [
+        passing = [
             item
             for item in reranked
             if not threshold_enabled or (rerank_enabled and (
@@ -1823,9 +1823,11 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
                 >=
                 request.min_rerank_score
             ))
-        ][:request.top_k]
+        ]
+        accepted = passing[:request.top_k]
         if trace is not None:
             trace["threshold_indices"] = [item["faiss_index"] for item in accepted]
+            trace["score_eligible_indices"] = [item["faiss_index"] for item in passing]
 
         if not accepted:
 
@@ -1866,7 +1868,8 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
 
         evidence = []
 
-        for item in accepted:
+        scoped_snapshot = bool(getattr(view, "snapshot_id", None))
+        for item in passing if scoped_snapshot else accepted:
 
             doc = item["doc"]
             version = doc.metadata.get("version")
@@ -1918,6 +1921,14 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
                     "index_snapshot_id", "document_version_id", "child_id", "parent_id", "page", "start", "end"
                 )})
 
+        scope_decision = None
+        if scoped_snapshot:
+            candidates_by_row = {row["child_id"]: item for row, item in zip(evidence, passing)}
+            evidence, scope_decision = select_policy_evidence(question, evidence, request.top_k)
+            accepted = [candidates_by_row[row["child_id"]] for row in evidence]
+            if trace is not None:
+                trace["policy_scope_selection"] = scope_decision
+
         total_ms = round(
             (
                 time.perf_counter()
@@ -1931,9 +1942,9 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
         # 9. Ranking completion != support for the requested subject/promise.
         # =================================================
 
-        assessment = assess_policy_support(question, evidence)
+        assessment = assess_policy_support(question, evidence, scope_decision=scope_decision)
         assessment.update(retrieval_completed=True, candidate_count=len(candidates),
-                          score_filtered_count=len(accepted))
+                          score_filtered_count=min(len(passing), request.top_k))
         # Keep diagnostic logs free of question terms and document contents.
         print("policy_evidence_support " + json.dumps({
             "question_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest(),

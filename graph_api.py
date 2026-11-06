@@ -54,8 +54,9 @@ def overview(snapshot_id: str | None = None, store=Depends(graph_store)):
 
 @router.post("/{sid}/build", status_code=201)
 def create(sid: str, mode: Literal["rules", "llm"] = "rules", batch_size: int = Query(100, ge=1, le=100),
+           source_snapshot_id: str | None = Query(default=None, pattern=r"^[a-f0-9]{32}$"),
            store=Depends(graph_store)):
-    return call(build, store, call(store.load_snapshot, sid, strict_sparse=True), mode, batch_size)
+    return call(build, store, call(store.load_snapshot, sid, strict_sparse=True), mode, batch_size, source_snapshot_id)
 
 
 class Review(BaseModel):
