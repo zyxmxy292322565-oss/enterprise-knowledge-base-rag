@@ -3,10 +3,61 @@ import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-from policy_evidence_support import assess_policy_support, POLICY_EVIDENCE_CACHE_VERSION
+from policy_evidence_support import assess_policy_support, select_policy_evidence, POLICY_EVIDENCE_CACHE_VERSION
 
 CONTENT = ('适用范围：AirPods、无线耳机。签收后7天内，商品完好、配件齐全、不影响二次销售时可申请无理由退货。'
            '签收后30天内质量问题可申请检测；人为损坏需核实。申请不等于退款批准。具体保修期限以凭证为准。')
+
+
+class SnapshotScopeTests(unittest.TestCase):
+    def setUp(self):
+        self.rows = [
+            dict(child_id="clause", source="rules.txt", document_version_id="t1",
+                 content="2025年内，如已核验质量问题且持有购买凭证，允许申请退款。不承诺退款必定获批。"),
+            dict(child_id="foreign", source="rule.pdf", document_version_id="p1",
+                 content="XG-4501 Refund application is prohibited for verified defect."),
+            dict(child_id="missing", source="rules.txt", document_version_id="t1",
+                 content="本政策未规定到账时间和运费承担。"),
+            dict(child_id="scope", source="rules.txt", document_version_id="t1",
+                 content="适用于家电类商品。"),
+        ]
+
+    def test_scope_anchor_is_reserved_before_top_k_and_negation_is_preserved(self):
+        question = "2025 年家电类商品已核验质量问题且有购买凭证，可以申请退款吗？是否保证获批？"
+        picked, scope = select_policy_evidence(question, self.rows, 2)
+        self.assertEqual([item["child_id"] for item in picked], ["clause", "scope"])
+        self.assertTrue(assess_policy_support(question, picked, scope_decision=scope)["sufficient_for_answer"])
+        self.assertIn("不承诺退款必定获批", picked[0]["content"])
+        self.assertIn("foreign", scope["rejected"])
+        self.assertFalse(select_policy_evidence(question.replace("2025", "2024"), self.rows, 2)[0])
+
+    def test_full_identifier_must_match_even_with_same_prefix(self):
+        for identifier, expected in (("XG-4501", True), ("XG-4502", False)):
+            question = f"PDF 对 {identifier} 已核验缺陷时的退款申请如何规定？"
+            picked, scope = select_policy_evidence(question, self.rows, 3)
+            self.assertIs(assess_policy_support(question, picked, scope_decision=scope)["sufficient_for_answer"], expected)
+            self.assertEqual([item["child_id"] for item in picked], ["foreign"] if expected else [])
+
+    def test_matching_multiple_versions_never_pools_evidence(self):
+        question = "家电类商品是否可以申请退款？"
+        duplicate = self.rows[-1] | {"child_id": "other_scope", "document_version_id": "t2"}
+        picked, scope = select_policy_evidence(question, [*self.rows, duplicate], 3)
+        self.assertFalse(picked)
+        self.assertEqual(scope["status"], "scope_unresolved")
+
+    def test_unknown_duration_is_refused_even_when_policy_discusses_it(self):
+        question = "这份家电类商品政策下，退款后最迟多少小时到账？"
+        picked, scope = select_policy_evidence(question, self.rows, 3)
+        result = assess_policy_support(question, picked, scope_decision=scope)
+        self.assertFalse(result["sufficient_for_answer"])
+        self.assertIn("requested_value_not_in_applicable_evidence", result["uncovered_terms"])
+
+    def test_scope_comparison_retains_both_document_anchors(self):
+        question = "TXT 的政策和 PDF 是否明确针对同一商品给出冲突规定？"
+        picked, scope = select_policy_evidence(question, self.rows, 3)
+        self.assertEqual(scope["status"], "scope_comparison")
+        self.assertEqual({item["child_id"] for item in picked}, {"foreign", "scope"})
+
 
 class SupportGuardTests(unittest.TestCase):
     def check(self, question, expected, content=CONTENT):
@@ -66,7 +117,7 @@ class SupportHTTPTests(unittest.TestCase):
     def test_low_but_passing_score_relevant_remains_usable(self):
         r,cache=self.query('AirPods Pro 2无理由退货的申请期限是什么？')
         self.assertEqual(r['code'],'SUCCESS');self.assertTrue(r['evidence_assessment']['sufficient_for_answer'])
-        self.assertTrue(r['evidence']);self.assertIn('lexical-support-v1',cache.call_args.kwargs['key'])
+        self.assertTrue(r['evidence']);cache.assert_not_called()
     def test_reranker_fault_is_not_business_refusal(self):
         r,_=self.query('AirPods退货政策是什么？',error=True)
         self.assertFalse(r['success']);self.assertEqual(r['code'],'RAG_QUERY_FAILED')

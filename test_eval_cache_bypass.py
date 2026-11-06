@@ -84,7 +84,7 @@ class ExistingEvaluationCacheBypassTests(unittest.TestCase):
         for mocked in (cache_read, cache_write, cache_stats, qa_log, perf_log):
             mocked.assert_not_called()
 
-    def test_public_ask_cache_hit_behavior_is_unchanged(self):
+    def test_legacy_ask_ignores_stale_cache(self):
         cached = {"answer": "缓存回答", "sources": [], "top_k": 1, "used_doc_count": 1}
         with patch.object(api_app.app.state, "all_docs", self.docs, create=True), \
              patch.object(api_app.app.state, "vectors", np.ones((1, 2)), create=True), \
@@ -95,12 +95,12 @@ class ExistingEvaluationCacheBypassTests(unittest.TestCase):
              patch.object(api_app, "save_rag_request_log"):
             result = api_app.ask_question(api_app.AskRequest(question="普通问题", top_k=1))
 
-        cache_read.assert_called_once()
-        cache_stats.assert_called_once_with("hit")
+        cache_read.assert_not_called()
+        cache_stats.assert_not_called()
         cache_write.assert_not_called()
-        self.assertTrue(result["from_cache"])
+        self.assertFalse(result.get("from_cache", False))
 
-    def test_public_ask_cache_miss_still_records_miss_and_writes_answer(self):
+    def test_legacy_ask_generates_without_cache_write(self):
         state_patches = self.rag_state()
         with state_patches[0], state_patches[1], state_patches[2], \
              state_patches[3], state_patches[4], state_patches[5], \
@@ -111,9 +111,9 @@ class ExistingEvaluationCacheBypassTests(unittest.TestCase):
              patch.object(api_app, "save_rag_request_log"):
             result = api_app.ask_question(api_app.AskRequest(question="普通问题", top_k=1))
 
-        cache_read.assert_called_once()
-        cache_stats.assert_called_once_with("miss")
-        cache_write.assert_called_once()
+        cache_read.assert_not_called()
+        cache_stats.assert_not_called()
+        cache_write.assert_not_called()
         self.assertFalse(result["from_cache"])
         self.assertEqual(result["answer"], "合成回答")
 

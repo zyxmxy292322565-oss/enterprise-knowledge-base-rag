@@ -1,3 +1,4 @@
+x-environment-acceptance: ${AUDIT_DOCKER_DISABLED:?Docker is not enabled for this isolated Windows environment}
 services:
   rag-backend:
     build:

@@ -1,0 +1,8 @@
+**
+!requirements.txt
+!requirements.runtime.lock.txt
+!*.py
+!deployment/
+!deployment/*.py
+!migrations/
+!migrations/*.sql

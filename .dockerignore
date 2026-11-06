@@ -13,6 +13,19 @@ __pycache__/
 # Never bake credentials into the image; pass them at runtime.
 .env
 .env.*
+.isolation/
+isolated.json
+secrets/
+compose.env
+*.dpapi
+*.dump
+*.sql.gz
+*.rdb
+*.aof
+*.safetensors
+pytorch_model*.bin
+rag-models/
+rag-v3-runtime/
 
 # Local documents, archives, and temporary outputs are not runtime code.
 *.pdf

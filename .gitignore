@@ -41,3 +41,13 @@ evaluation/experiments/**/probe_record.json
 evaluation/experiments/**/first_call_probe.json
 evaluation/experiments/**/document_upload_results.json
 policy_docs/
+
+.isolation/
+isolated.json
+*.dpapi
+*.safetensors
+pytorch_model*.bin
+compose.env
+secrets/
+rag-v3-runtime/
+rag-models/

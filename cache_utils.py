@@ -57,7 +57,9 @@ def get_cache_paths(
     cache_config = f"{embed_model_name}_{chunk_size}_{chunk_overlap}_{index_type}"
     cache_key = hashlib.md5(cache_config.encode("utf-8")).hexdigest()[:8]
 
-    cache_dir = "cache"
+    from isolated_config import require_target
+    require_target("mysql")
+    cache_dir = os.environ["RAG_V2_CACHE_DIR"]
     os.makedirs(cache_dir, exist_ok=True)
 
     vectors_cache_file = os.path.join(cache_dir, f"vectors_{cache_key}.pkl")

@@ -1,4 +1,5 @@
 import os
+import logging
 import hashlib
 from contextlib import asynccontextmanager
 import json
@@ -6,7 +7,7 @@ import numpy as np
 import faiss
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 from redis_utils import (
     check_redis_connection,
@@ -15,13 +16,21 @@ from redis_utils import (
     invalidate_rag_query_cache,
     incr_cache_stat,
     get_rag_cache_stats,
+    count_cache_by_prefix,
+    delete_cache_by_prefix,
     reset_rag_cache_stats,
     clear_all_rag_cache_data
 )
 from cache_utils import build_policy_cache_key, RAG_QUERY_CACHE_PREFIX
-from policy_evidence_support import assess_policy_support, POLICY_EVIDENCE_CACHE_VERSION
+from knowledge_v2_api import configure_knowledge, isolated_settings, model_path, require_management_token, router as knowledge_router
+from eval_center_api import router as eval_center_router
+from retrieval_debug import router as retrieval_debug_router
+from graph_api import router as graph_router
+from retrieval_engine import (RetrievalConfig, RetrievalRequest, expand_parents, hyde_generator,
+                              identity as retrieval_identity, rescore, retrieve, subquery_gaps)
+from policy_evidence_support import assess_policy_support, select_policy_evidence, POLICY_EVIDENCE_CACHE_VERSION
 from redis_utils import get_cache, set_cache
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import Depends, FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from agent_utils import simple_agent_chat
@@ -145,7 +154,7 @@ class TestAskRequest(BaseModel):
     top_k: int = 5
 
 
-class AskRequest(BaseModel):
+class AskRequest(RetrievalRequest):
     question: str
     top_k: int = 3
 
@@ -227,7 +236,7 @@ class RagEvalRunAllRequest(BaseModel):
 
     low_score_threshold: float = 0.6
 
-class PolicyRAGRequest(BaseModel):
+class PolicyRAGRequest(RetrievalRequest):
     """
     Policy RAG 检索请求。
 
@@ -258,11 +267,22 @@ async def lifespan(app: FastAPI):
     服务启动时初始化 RAG 状态、加载模型、加载缓存。
     """
 
+    v2 = os.getenv("RAG_V2_ENABLED") == "1"
+    if not v2:
+        raise RuntimeError("Isolated checkout requires RAG_V2_ENABLED=1")
+    if v2:
+        root, connect = isolated_settings()
+        model_path("RAG_V2_EMBED_PATH")
+        model_path("RAG_V2_RERANK_PATH")
+
     # 初始化数据库表
     try:
-        init_db()
-        print("数据库初始化完成")
+        if not v2:
+            init_db()
+        print("隔离模式启动：不执行建表或迁移" if v2 else "数据库初始化完成")
     except Exception as e:
+        if v2:
+            raise
         print("数据库初始化失败：", e)
 
     # 初始化全局状态
@@ -276,6 +296,19 @@ async def lifespan(app: FastAPI):
     app.state.embed_model = embed_model
     app.state.rerank_model = rerank_model
     app.state.chat_model = load_llm()
+
+    if v2:
+        configure_knowledge(app, root, connect, embed_model)
+        try:
+            app.state.knowledge.pin()
+        except Exception:
+            # Keep management available for an explicit rollback.
+            logging.getLogger(__name__).exception("Active snapshot unavailable at startup")
+        try:
+            yield
+        finally:
+            app.state.knowledge = None
+        return
 
     # 获取缓存路径
     vectors_cache_file, all_docs_cache_file, index_cache_file = get_cache_paths(
@@ -319,6 +352,71 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+@app.middleware("http")
+async def isolated_readonly_phase(request,call_next):
+    if os.getenv('RAG_V2_AUDIT_READONLY')=='1' and request.method not in {'GET','HEAD','OPTIONS'}:
+        from fastapi.responses import JSONResponse
+        if os.getenv('RAG_V2_DIRECTED_TEST_WRITES')!='1':
+            return JSONResponse(status_code=403,content={'detail':'Environment acceptance is read-only'})
+        try:require_management_token(request.headers.get('X-RAG-V2-Token'))
+        except HTTPException:
+            return JSONResponse(status_code=403,content={'detail':'Management token required for isolated test writes'})
+    return await call_next(request)
+
+
+app.include_router(knowledge_router)
+app.include_router(eval_center_router)
+app.include_router(retrieval_debug_router)
+app.include_router(graph_router)
+
+
+def _knowledge():
+    return getattr(app.state, "knowledge", None)
+
+
+def _query_view():
+    store = _knowledge()
+    return store.pin() if store else app.state
+
+
+def _versioned_key(view, endpoint: str, key: str, request=None, strategy=None) -> str:
+    if view is app.state:
+        # Legacy in-memory indexes have no shared, authoritative publication generation.
+        return ""
+    if strategy is not None or (request is not None and request.chat_history):
+        payload = [key, strategy.model_dump() if strategy is not None else None, [turn.model_dump() for turn in request.chat_history],
+                   retrieval_identity(), view.sparse is not None, view.sparse_error]
+        if strategy is not None and strategy.graph_enabled:
+            payload.append(datetime.now(timezone.utc).date().isoformat())
+        key = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    return view.cache_key(endpoint, key, app.state.knowledge_model_config, app.state.knowledge_namespace)
+
+
+def _strategy(request, view, options):
+    if not getattr(view, "snapshot_id", None):
+        return None
+    return options.get("retrieval") or request.retrieval
+
+
+def _advanced_candidates(view, request, config, limit, trace):
+    result = retrieve(view, request.question.strip(), request.chat_history, config, limit,
+                      app.state.embed_model, hyde_generator() if config.hyde_enabled else None)
+    if trace is not None:
+        trace["retrieval"] = result.trace
+    if not result.usable():
+        raise RuntimeError("All requested retrieval channels failed")
+    return result
+
+
+def _eligible_for_cache(advanced):
+    return (advanced is None or (not advanced.trace["degraded"] and
+            all(advanced.trace["query"][key]["status"] != "fallback" for key in ("rewrite", "hyde"))))
+
+
+def _knowledge_cache_prefix() -> str:
+    return f"rag:v2:{app.state.knowledge_namespace}:"
+
 
 # ==============================
 # 上传文件安全限制
@@ -430,17 +528,22 @@ def system_health():
         }
 
     # 3. 检查 RAG 状态
-    has_index = app.state.index is not None
-    has_vectors = app.state.vectors is not None
-    doc_count = len(app.state.all_docs)
-    index_count = int(app.state.index.ntotal) if app.state.index is not None else 0
+    view = _query_view()
+    has_index = view.index is not None
+    has_vectors = view.vectors is not None
+    doc_count = len(view.all_docs)
+    index_count = int(view.index.ntotal) if view.index is not None else 0
 
     has_embed_model = hasattr(app.state, "embed_model")
     has_rerank_model = hasattr(app.state, "rerank_model")
     has_chat_model = hasattr(app.state, "chat_model")
 
+    # A fresh knowledge store can accept uploads before it has a published index.
+    empty_knowledge = _knowledge() is not None and view.snapshot_id is None
+    models_ready = has_embed_model and has_rerank_model and has_chat_model
     rag_status = {
-        "ok": has_index and has_vectors and has_embed_model and has_rerank_model and has_chat_model,
+        "ok": models_ready and (empty_knowledge or (has_index and has_vectors)),
+        "ready_for_queries": models_ready and has_index and has_vectors,
         "doc_count": doc_count,
         "index_count": index_count,
         "has_index": has_index,
@@ -495,6 +598,8 @@ def get_redis_rag_cache_stats():
     """
     try:
         stats = get_rag_cache_stats()
+        if _knowledge():
+            stats["cache_count"] = count_cache_by_prefix(_knowledge_cache_prefix())
 
         return {
             "success": True,
@@ -515,7 +620,8 @@ def clear_rag_answer_cache():
     手动清理 RAG 问答缓存。
     """
     try:
-        deleted_count = invalidate_rag_query_cache()
+        deleted_count = (delete_cache_by_prefix(_knowledge_cache_prefix()) if _knowledge()
+                         else invalidate_rag_query_cache())
 
         return {
             "success": True,
@@ -557,7 +663,11 @@ def clear_all_rag_cache():
     清理 RAG 问答缓存 + 缓存统计。
     """
     try:
-        result = clear_all_rag_cache_data()
+        if _knowledge():
+            result = {"answer_deleted_count": delete_cache_by_prefix(_knowledge_cache_prefix()),
+                      "stats_deleted_count": reset_rag_cache_stats()}
+        else:
+            result = clear_all_rag_cache_data()
 
         return {
             "success": True,
@@ -577,12 +687,14 @@ def rag_status():
     """
     查看当前 RAG 状态。
     """
+    view = _query_view()
     return {
-        "doc_count": len(app.state.all_docs),
-        "has_vectors": app.state.vectors is not None,
-        "has_index": app.state.index is not None,
-        "index_count": int(app.state.index.ntotal) if app.state.index is not None else 0,
-        "processed_file_count": len(app.state.processed_file_hashes),
+        "doc_count": len(view.all_docs),
+        "has_vectors": view.vectors is not None,
+        "has_index": view.index is not None,
+        "index_count": int(view.index.ntotal) if view.index is not None else 0,
+        "processed_file_count": (len(view.manifest["members"]) if _knowledge()
+                                 else len(app.state.processed_file_hashes)),
         "has_embed_model": hasattr(app.state, "embed_model"),
         "has_rerank_model": hasattr(app.state, "rerank_model"),
         "has_chat_model": hasattr(app.state, "chat_model"),
@@ -616,14 +728,23 @@ def get_qa_logs(
 
 @app.get("/documents")
 def get_documents():
-    documents = load_document_records()
+    store = _knowledge()
+    if store:
+        documents = [{"ID": m["document_id"], "文件名": m["source"], "文件hash": m["legacy_file_hash"],
+                      "文件类型": m["source"].rsplit(".", 1)[-1].lower(), "分类": m["category"],
+                      "商品范围": None, "版本": m["policy_version"], "创建人": m["origin"],
+                      "文本块数量": m["chunk_count"], "上传时间": m.get("created_at"),
+                      "更新时间": m.get("updated_at")}
+                     for m in store.pin().manifest["members"]]
+    else:
+        documents = load_document_records()
 
     return {
         "count": len(documents),
         "data": documents
     }
 
-@app.delete("/documents/{file_hash}")
+@app.delete("/documents/{file_hash}", dependencies=[Depends(require_management_token)])
 def delete_document_by_hash(file_hash: str):
     """
     根据 file_hash 删除一个文档。
@@ -642,6 +763,8 @@ def delete_document_by_hash(file_hash: str):
     - 清理 Redis 问答缓存
     """
 
+    if _knowledge():
+        return {"success": False, "message": "请通过 V2 数据中台删除并发布文档"}
     try:
         old_doc_count = len(app.state.all_docs)
 
@@ -729,6 +852,8 @@ def delete_document_by_hash(file_hash: str):
 @app.get("/stats")
 def get_stats():
     stats = load_dashboard_stats()
+    if _knowledge():
+        stats["文档记录总数"] = len(_query_view().manifest["members"])
 
     return {
         "data": stats
@@ -805,7 +930,7 @@ def update_note(log_id: int, request: UpdateNoteRequest):
 # 上传测试接口
 # ==============================
 
-@app.post("/test_upload")
+@app.post("/test_upload", dependencies=[Depends(require_management_token)])
 async def test_upload(file: UploadFile = File(...)):
     file_bytes = await file.read()
 
@@ -880,7 +1005,7 @@ def rebuild_faiss_index_from_docs():
         "index_count": int(app.state.index.ntotal)
     }
 
-@app.post("/upload")
+@app.post("/upload", dependencies=[Depends(require_management_token)])
 async def upload_file(
     file: UploadFile = File(...),
     category: str = Form("general_policy"),
@@ -906,6 +1031,8 @@ async def upload_file(
     14. 清理 Redis 旧问答缓存
     """
 
+    if _knowledge():
+        return {"success": False, "message": "请通过 V2 数据中台上传并发布文档"}
     try:
         metadata = {
             "category": category.strip() or "general_policy",
@@ -1160,7 +1287,8 @@ def search_docs(request: SearchRequest):
     FAISS 检索测试接口。
     """
 
-    if app.state.index is None or app.state.vectors is None or len(app.state.all_docs) == 0:
+    view = _query_view()
+    if view.index is None or view.vectors is None or len(view.all_docs) == 0:
         return {
             "message": "当前知识库为空，请先上传文档",
             "results": []
@@ -1169,9 +1297,9 @@ def search_docs(request: SearchRequest):
     query_vector = app.state.embed_model.encode([request.question])
     query_vector = np.array(query_vector, dtype=np.float32)
 
-    top_k = min(request.top_k, len(app.state.all_docs))
+    top_k = min(request.top_k, len(view.all_docs))
 
-    distances, indices = app.state.index.search(query_vector, top_k)
+    distances, indices = view.index.search(query_vector, top_k)
 
     results = []
 
@@ -1179,7 +1307,7 @@ def search_docs(request: SearchRequest):
         if idx == -1:
             continue
 
-        doc = app.state.all_docs[idx]
+        doc = view.all_docs[idx]
 
         results.append({
             "rank": rank,
@@ -1210,7 +1338,8 @@ def search_rerank(request: SearchRerankRequest):
     FAISS 检索 + Rerank 精排测试接口。
     """
 
-    if app.state.index is None or app.state.vectors is None or len(app.state.all_docs) == 0:
+    view = _query_view()
+    if view.index is None or view.vectors is None or len(view.all_docs) == 0:
         return {
             "message": "当前知识库为空，请先上传文档",
             "results": []
@@ -1221,9 +1350,9 @@ def search_rerank(request: SearchRerankRequest):
     query_vector = np.array(query_vector, dtype=np.float32)
     timing["embedding_ms"] = round((time.perf_counter() - embedding_start) * 1000, 2)
 
-    faiss_k = min(request.faiss_k, len(app.state.all_docs))
+    faiss_k = min(request.faiss_k, len(view.all_docs))
 
-    distances, indices = app.state.index.search(query_vector, faiss_k)
+    distances, indices = view.index.search(query_vector, faiss_k)
 
     candidates = []
 
@@ -1231,7 +1360,7 @@ def search_rerank(request: SearchRerankRequest):
         if idx == -1:
             continue
 
-        doc = app.state.all_docs[idx]
+        doc = view.all_docs[idx]
 
         candidates.append({
             "faiss_rank": rank,
@@ -1348,7 +1477,7 @@ def query_policy_rag(
     return _query_policy_rag(request)
 
 
-def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, trace=None):
+def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, trace=None, snapshot=None):
     """
     Policy / FAQ RAG 检索接口。
 
@@ -1380,6 +1509,13 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
     # Cache 查询
     # =====================================================
 
+    try:
+        view = snapshot if snapshot is not None else _query_view()
+    except Exception:
+        logging.getLogger(__name__).exception("Policy snapshot unavailable")
+        return {"success": False, "code": "RAG_QUERY_FAILED", "message": "知识库快照暂不可用",
+                "refused": True, "answer": None, "evidence": []}
+
     cache_key = build_policy_cache_key(
         question=question,
         top_k=request.top_k,
@@ -1387,19 +1523,8 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
         min_rerank_score=request.min_rerank_score,
         policy_version="v1"
     ) + ":" + POLICY_EVIDENCE_CACHE_VERSION
-
-    cache_start = time.perf_counter()
-
-    cached_result = None if evaluating else get_cache(cache_key)
-
-    redis_ms = round(
-        (
-                time.perf_counter()
-                -
-                cache_start
-        ) * 1000,
-        2
-    )
+    strategy = _strategy(request, view, options)
+    cache_key = _versioned_key(view, "policy", cache_key, request, strategy)
 
     # ================================
     # Redis Cache 查询
@@ -1411,7 +1536,7 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
 
         redis_start = time.perf_counter()
 
-        cached_result = None if evaluating else get_cache(cache_key)
+        cached_result = None if evaluating or not cache_key else get_cache(cache_key)
 
         redis_ms = round(
             (
@@ -1453,11 +1578,11 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
     # =====================================================
 
     if (
-        app.state.index is None
+        view.index is None
         or
-        app.state.vectors is None
+        view.vectors is None
         or
-        len(app.state.all_docs) == 0
+        len(view.all_docs) == 0
     ):
         return {
             "success": False,
@@ -1478,83 +1603,96 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
             time.perf_counter()
         )
 
-        query_vector = (
-            app.state.embed_model.encode(
-                [question]
+        advanced = None
+        if strategy is None:
+            query_vector = (
+                app.state.embed_model.encode(
+                    [question]
+                )
             )
-        )
 
-        query_vector = np.array(
-            query_vector,
-            dtype=np.float32
-        )
+            query_vector = np.array(
+                query_vector,
+                dtype=np.float32
+            )
 
-        embedding_ms = round(
-            (
+            embedding_ms = round(
+                (
+                    time.perf_counter()
+                    -
+                    embedding_start
+                ) * 1000,
+                2
+            )
+
+            # =================================================
+            # 4. FAISS 初筛
+            # =================================================
+
+            faiss_start = (
                 time.perf_counter()
-                -
-                embedding_start
-            ) * 1000,
-            2
-        )
+            )
 
-        # =================================================
-        # 4. FAISS 初筛
-        # =================================================
-
-        faiss_start = (
-            time.perf_counter()
-        )
-
-        requested_faiss_k = (
-            request.top_k
-            *
-            request.faiss_multiplier
-        )
-
-        faiss_k = min(
-            max(
-                requested_faiss_k,
+            requested_faiss_k = (
                 request.top_k
-            ),
-            len(app.state.all_docs)
-        )
-        if options.get('candidate_k') is not None:
-            faiss_k = min(options['candidate_k'], len(app.state.all_docs))
+                *
+                request.faiss_multiplier
+            )
+
+            faiss_k = min(
+                max(
+                    requested_faiss_k,
+                    request.top_k
+                ),
+                len(view.all_docs)
+            )
+            if options.get('candidate_k') is not None:
+                faiss_k = min(options['candidate_k'], len(view.all_docs))
+        else:
+            faiss_start = time.perf_counter()
+            faiss_k = min(options.get("candidate_k") or max(request.top_k * request.faiss_multiplier,
+                         request.top_k), len(view.all_docs))
+            advanced = _advanced_candidates(view, request, strategy, faiss_k, trace)
+            embedding_ms = sum(route.get("embedding_ms", 0) for route in advanced.trace["routes"])
         if trace is not None:
             trace['effective_parameters'] = {'top_k': request.top_k, 'faiss_k': faiss_k,
                 'faiss_multiplier': request.faiss_multiplier, 'min_rerank_score': request.min_rerank_score,
-                'rerank_enabled': options.get('rerank_enabled', True), 'cache_mode': 'bypass' if evaluating else 'normal'}
+                'rerank_enabled': strategy.rerank_enabled if strategy else options.get('rerank_enabled', True),
+                'cache_mode': 'bypass' if evaluating else 'normal'}
 
-        distances, indices = (
-            app.state.index.search(
-                query_vector,
-                faiss_k
-            )
-        )
-
-        candidates = []
-
-        for rank, idx in enumerate(
-            indices[0],
-            start=1
-        ):
-
-            if idx == -1:
-                continue
-
-            doc = (
-                app.state.all_docs[idx]
-            )
-
-            candidates.append({
-                "doc": doc,
-                "faiss_rank": rank,
-                "faiss_index": int(idx),
-                "faiss_distance": float(
-                    distances[0][rank - 1]
+        if advanced is None:
+            distances, indices = (
+                view.index.search(
+                    query_vector,
+                    faiss_k
                 )
-            })
+            )
+
+            candidates = []
+
+            for rank, idx in enumerate(
+                indices[0],
+                start=1
+            ):
+
+                if idx == -1:
+                    continue
+
+                doc = (
+                    view.all_docs[idx]
+                )
+
+                candidates.append({
+                    "doc": doc,
+                    "faiss_rank": rank,
+                    "faiss_index": int(idx),
+                    "faiss_distance": float(
+                        distances[0][rank - 1]
+                    )
+                })
+
+        else:
+            candidates = advanced.candidates
 
         if trace is not None:
             trace['faiss_candidates'] = [{'source': x['doc'].metadata.get('source'),
@@ -1562,14 +1700,15 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
                 'content': x['doc'].page_content, 'faiss_rank': x['faiss_rank'],
                 'faiss_index': x['faiss_index'], 'faiss_distance': x['faiss_distance']} for x in candidates]
 
-        faiss_ms = round(
+        faiss_ms = (sum(max(0, route["ms"] - route.get("embedding_ms", 0))
+                        for route in advanced.trace["routes"]) if advanced is not None else round(
             (
                 time.perf_counter()
                 -
                 faiss_start
             ) * 1000,
             2
-        )
+        ))
 
         # =================================================
         # 5. FAISS 没召回
@@ -1625,8 +1764,11 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
             in candidates
         ]
 
-        rerank_enabled = options.get('rerank_enabled', True)
-        rerank_scores = app.state.rerank_model.predict(rerank_pairs) if rerank_enabled else [0.0] * len(candidates)
+        if advanced is None:
+            rerank_enabled = options.get('rerank_enabled', True)
+            rerank_scores = app.state.rerank_model.predict(rerank_pairs) if rerank_enabled else [0.0] * len(candidates)
+        else:
+            rerank_scores, rerank_enabled = rescore(advanced, rerank_pairs, app.state.rerank_model)
 
         reranked = []
 
@@ -1670,17 +1812,26 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
         # 7. Threshold 拒答
         # =================================================
 
-        accepted = [
+        threshold_enabled = rerank_enabled if advanced is None else strategy.threshold_enabled and strategy.rerank_enabled
+        if advanced is not None:
+            advanced.trace["threshold"] = {"status": "used" if threshold_enabled and rerank_enabled else
+                                            "unavailable" if threshold_enabled else "not_used",
+                                            "mode": "per_evidence", "minimum": request.min_rerank_score}
+        passing = [
             item
             for item in reranked
-            if not rerank_enabled or (
+            if not threshold_enabled or (rerank_enabled and (
                 item[
                     "rerank_score"
                 ]
                 >=
                 request.min_rerank_score
-            )
-        ][:request.top_k]
+            ))
+        ]
+        accepted = passing[:request.top_k]
+        if trace is not None:
+            trace["threshold_indices"] = [item["faiss_index"] for item in accepted]
+            trace["score_eligible_indices"] = [item["faiss_index"] for item in passing]
 
         if not accepted:
 
@@ -1721,7 +1872,8 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
 
         evidence = []
 
-        for item in accepted:
+        scoped_snapshot = bool(getattr(view, "snapshot_id", None))
+        for item in passing if scoped_snapshot else accepted:
 
             doc = item["doc"]
             version = doc.metadata.get("version")
@@ -1756,7 +1908,7 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
                     version if version is not None else legacy_version,
 
                 "rerank_score":
-                    item[
+                    None if advanced is not None and not rerank_enabled else item[
                         "rerank_score"
                     ],
 
@@ -1768,6 +1920,18 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
                 "content":
                     doc.page_content
             })
+            if doc.metadata.get("index_snapshot_id"):
+                evidence[-1].update({key: doc.metadata[key] for key in (
+                    "index_snapshot_id", "document_version_id", "child_id", "parent_id", "page", "start", "end"
+                )})
+
+        scope_decision = None
+        if scoped_snapshot:
+            candidates_by_row = {row["child_id"]: item for row, item in zip(evidence, passing)}
+            evidence, scope_decision = select_policy_evidence(question, evidence, request.top_k)
+            accepted = [candidates_by_row[row["child_id"]] for row in evidence]
+            if trace is not None:
+                trace["policy_scope_selection"] = scope_decision
 
         total_ms = round(
             (
@@ -1782,9 +1946,9 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
         # 9. Ranking completion != support for the requested subject/promise.
         # =================================================
 
-        assessment = assess_policy_support(question, evidence)
+        assessment = assess_policy_support(question, evidence, scope_decision=scope_decision)
         assessment.update(retrieval_completed=True, candidate_count=len(candidates),
-                          score_filtered_count=len(accepted))
+                          score_filtered_count=min(len(passing), request.top_k))
         # Keep diagnostic logs free of question terms and document contents.
         print("policy_evidence_support " + json.dumps({
             "question_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest(),
@@ -1794,7 +1958,10 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
         }, ensure_ascii=False), flush=True)
         if trace is not None:
             trace["evidence_assessment"] = assessment
-        if not assessment["sufficient_for_answer"]:
+        gaps = subquery_gaps(advanced, accepted, assess_policy_support) if advanced is not None else []
+        if advanced is not None:
+            expand_parents(advanced, accepted, char_budget=1200)
+        if not assessment["sufficient_for_answer"] or gaps:
             return {
                 "success": True, "code": "POLICY_NOT_FOUND", "refused": True,
                 "message": "未找到足以支持该问题商品范围或具体承诺的政策依据，不能将商品专项条款直接套用于其他商品。请补充适用商品与条件，或联系人工客服核实。",
@@ -1805,6 +1972,8 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
                            "total_ms": round((time.perf_counter()-request_start)*1000, 2)},
             }
 
+        if trace is not None:
+            trace["used_indices"] = [item["faiss_index"] for item in accepted]
         result = {
             "success": True,
             "code": "SUCCESS",
@@ -1833,7 +2002,7 @@ def _query_policy_rag(request: PolicyRAGRequest, *, evaluation_options=None, tra
         # 写入 Redis 缓存
         # ==================================
 
-        if not evaluating:
+        if cache_key and not evaluating and _eligible_for_cache(advanced):
             try:
                 set_cache(key=cache_key, value=result, expire_seconds=3600)
             except Exception as e:
@@ -1865,7 +2034,7 @@ def ask_question(request: AskRequest):
     return _ask_question(request)
 
 
-def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
+def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None, snapshot=None):
     """
     RAG 问答接口：
     1. 用户问题向量化
@@ -1900,8 +2069,9 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
     }
 
     try:
+        view = snapshot if snapshot is not None else _query_view()
         # 0. 判断知识库是否为空
-        if app.state.index is None or app.state.vectors is None or len(app.state.all_docs) == 0:
+        if view.index is None or view.vectors is None or len(view.all_docs) == 0:
             if trace is not None:
                 trace["status"] = "error"
                 trace["error_type"] = "KnowledgeBaseUnavailable"
@@ -1917,7 +2087,7 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
 
         # 0.1 先计算本次最终最多使用多少个文本块
         # 用户可能传 top_k=5，但知识库只有 2 个 chunk，所以要取 min
-        top_k = min(request.top_k, len(app.state.all_docs))
+        top_k = min(request.top_k, len(view.all_docs))
 
         # 防止 top_k 出现 0
         if top_k <= 0:
@@ -1942,15 +2112,17 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
             f"min_rerank_score={request.min_rerank_score}_"
             f"max_context_chars={request.max_context_chars}_"
             f"max_chunk_chars={request.max_chunk_chars}_"
-            f"doc_count={len(app.state.all_docs)}"
+            f"doc_count={len(view.all_docs)}"
         )
 
         cache_key = f"{RAG_QUERY_CACHE_PREFIX}{hashlib.md5(cache_raw.encode('utf-8')).hexdigest()}"
+        strategy = _strategy(request, view, options)
+        cache_key = _versioned_key(view, "ask", cache_key, request, strategy)
 
         # 0.3 先查 Redis 缓存
         current_stage = "cache_read"
         cache_read_start = time.perf_counter()
-        cached_result = None if evaluating else get_cache(cache_key)
+        cached_result = None if evaluating or not cache_key else get_cache(cache_key)
         timing["cache_read_ms"] = round((time.perf_counter() - cache_read_start) * 1000, 2)
 
         if cached_result:
@@ -1982,7 +2154,7 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
             return cached_result
 
         # 0.4 没有命中缓存，记录 miss
-        if not evaluating:
+        if cache_key and not evaluating:
             try:
                 incr_cache_stat("miss")
             except Exception as e:
@@ -1990,22 +2162,29 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
 
         # 1. 问题向量化
         current_stage = "embedding"
-        embedding_start = time.perf_counter()
+        advanced = None
+        if strategy is None:
+            embedding_start = time.perf_counter()
 
-        query_vector = app.state.embed_model.encode([request.question])
-        query_vector = np.array(query_vector, dtype=np.float32)
+            query_vector = app.state.embed_model.encode([request.question])
+            query_vector = np.array(query_vector, dtype=np.float32)
 
-        timing["embedding_ms"] = round(
-            (time.perf_counter() - embedding_start) * 1000,
-            2
-        )
+            timing["embedding_ms"] = round(
+                (time.perf_counter() - embedding_start) * 1000,
+                2
+            )
 
-        # 2. FAISS 初筛
-        # 初筛可以多取一些，比如 top_k * 2，然后交给 Rerank 精排
-        faiss_multiplier = max(1, request.faiss_multiplier)
+            # 2. FAISS 初筛
+            # 初筛可以多取一些，比如 top_k * 2，然后交给 Rerank 精排
+            faiss_multiplier = max(1, request.faiss_multiplier)
 
-        faiss_k = min(options.get("candidate_k") or top_k * faiss_multiplier,
-                      len(app.state.all_docs))
+            faiss_k = min(options.get("candidate_k") or top_k * faiss_multiplier,
+                          len(view.all_docs))
+        else:
+            faiss_multiplier = max(1, request.faiss_multiplier)
+            faiss_k = min(options.get("candidate_k") or top_k * faiss_multiplier, len(view.all_docs))
+            advanced = _advanced_candidates(view, request, strategy, faiss_k, trace)
+            timing["embedding_ms"] = sum(route.get("embedding_ms", 0) for route in advanced.trace["routes"])
         if trace is not None:
             trace["effective_parameters"] = {
                 "top_k": top_k, "faiss_k": faiss_k,
@@ -2013,35 +2192,41 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
                 "min_rerank_score": request.min_rerank_score,
                 "max_context_chars": request.max_context_chars,
                 "max_chunk_chars": request.max_chunk_chars,
-                "rerank_enabled": options.get("rerank_enabled", True),
+                "rerank_enabled": strategy.rerank_enabled if strategy else options.get("rerank_enabled", True),
                 "cache_mode": "bypass" if evaluating else "normal",
             }
 
         current_stage = "faiss_search"
         faiss_start = time.perf_counter()
 
-        distances, indices = app.state.index.search(query_vector, faiss_k)
+        if advanced is None:
+            distances, indices = view.index.search(query_vector, faiss_k)
 
-        timing["faiss_search_ms"] = round(
-            (time.perf_counter() - faiss_start) * 1000,
-            2
-        )
+            timing["faiss_search_ms"] = round(
+                (time.perf_counter() - faiss_start) * 1000,
+                2
+            )
 
-        # 3. 构建 candidates
-        candidates = []
+            # 3. 构建 candidates
+            candidates = []
 
-        for rank, idx in enumerate(indices[0], start=1):
-            if idx == -1:
-                continue
+            for rank, idx in enumerate(indices[0], start=1):
+                if idx == -1:
+                    continue
 
-            doc = app.state.all_docs[idx]
+                doc = view.all_docs[idx]
 
-            candidates.append({
-                "faiss_rank": rank,
-                "faiss_index": int(idx),
-                "faiss_distance": float(distances[0][rank - 1]),
-                "doc": doc
-            })
+                candidates.append({
+                    "faiss_rank": rank,
+                    "faiss_index": int(idx),
+                    "faiss_distance": float(distances[0][rank - 1]),
+                    "doc": doc
+                })
+
+        else:
+            candidates = advanced.candidates
+            timing["faiss_search_ms"] = sum(max(0, route["ms"] - route.get("embedding_ms", 0))
+                                            for route in advanced.trace["routes"])
 
         if trace is not None:
             trace["faiss_candidates"] = [
@@ -2075,9 +2260,12 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
         current_stage = "rerank"
         rerank_start = time.perf_counter()
 
-        rerank_enabled = options.get("rerank_enabled", True)
-        rerank_scores = (app.state.rerank_model.predict(rerank_pairs)
-                         if rerank_enabled else [0.0] * len(candidates))
+        if advanced is None:
+            rerank_enabled = options.get("rerank_enabled", True)
+            rerank_scores = (app.state.rerank_model.predict(rerank_pairs)
+                             if rerank_enabled else [0.0] * len(candidates))
+        else:
+            rerank_scores, rerank_enabled = rescore(advanced, rerank_pairs, app.state.rerank_model)
 
         reranked_docs = []
 
@@ -2111,7 +2299,12 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
 
         min_rerank_score = request.min_rerank_score
 
-        if not reranked_docs or (rerank_enabled and reranked_docs[0]["score"] < min_rerank_score):
+        threshold_enabled = rerank_enabled if advanced is None else strategy.threshold_enabled and strategy.rerank_enabled
+        if advanced is not None:
+            advanced.trace["threshold"] = {"status": "used" if threshold_enabled and rerank_enabled else
+                                            "unavailable" if threshold_enabled else "not_used",
+                                            "mode": "top_score", "minimum": min_rerank_score}
+        if not reranked_docs or (threshold_enabled and (not rerank_enabled or reranked_docs[0]["score"] < min_rerank_score)):
             if trace is not None:
                 trace["status"] = "refused_low_relevance"
                 trace["refusal_reason"] = "top_rerank_score_below_threshold"
@@ -2178,12 +2371,29 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
         {content}
         """
 
-            if current_length + len(part) > MAX_CONTEXT_CHARS:
+            separator = 2 if advanced is not None and context_parts else 0
+            if current_length + len(part) + separator > MAX_CONTEXT_CHARS:
                 break
 
             context_parts.append(part)
-            current_length += len(part)
-            used_docs.append(d)
+            current_length += len(part) + separator
+            used_docs.append(d if advanced is None else d | {"visible_text": content})
+
+        if advanced is not None:
+            gaps = subquery_gaps(advanced, used_docs, assess_policy_support)
+            if gaps:
+                if trace is not None:
+                    trace.update(status="refused_incomplete_subqueries", refusal_reason="missing_child_support")
+                timing["total_ms"] = round((time.perf_counter() - request_start_time) * 1000, 2)
+                return {"message": "部分子问题证据不足", "question": request.question,
+                        "answer": "根据已上传文档，无法为所有子问题找到足够依据。",
+                        "sources": [], "from_cache": False, "cache_key": cache_key, "timing": timing}
+            label = "【相邻背景，不能作为引用或独立结论依据】"
+            if strategy.parent_child_enabled:
+                available = max(0, MAX_CONTEXT_CHARS - len("\n\n".join(context_parts)) - len(label) - 4)
+                extras = expand_parents(advanced, used_docs, available)
+                if extras:
+                    context_parts.append(label + "\n" + "\n".join(item["text"] for item in extras))
 
         context = "\n\n".join(context_parts)
         if trace is not None:
@@ -2199,6 +2409,7 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
                     "faiss_rank": d["faiss_rank"],
                     "faiss_distance": d["faiss_distance"],
                     "rerank_score": d["score"] if rerank_enabled else None,
+                    "visible_chars": len(d["doc"].page_content[:MAX_CHUNK_CHARS]),
                 }
                 for d in used_docs
             ]
@@ -2249,14 +2460,23 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
         请用中文回答。
         """
 
+        if advanced is not None:
+            prompt += "\n必须仅引用标有来源和文本块编号的 Child 资料。相邻背景仅帮助理解，不能作为独立证据。"
+            if advanced.trace["query"]["rewrite"]["status"] == "used":
+                prompt += "\n以下为用户先前原话，仅用于理解追问，不是政策证据：\n" + advanced.trace["query"]["effective_question"]
+
         # 8. 调用大模型
         if trace is not None:
             trace["prompt"] = prompt
         current_stage = "llm_generation"
+        if trace is not None:
+            trace["model_calls"] = 1
         llm_start = time.perf_counter()
 
         response = app.state.chat_model.invoke(prompt)
         answer = response.content
+        if trace is not None:
+            trace["usage"] = getattr(response, "usage_metadata", None)
 
         timing["llm_ms"] = round(
             (time.perf_counter() - llm_start) * 1000,
@@ -2275,7 +2495,7 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
                 "source": doc.metadata.get("source"),
                 "file_hash": doc.metadata.get("file_hash"),
                 "chunk_id": doc.metadata.get("chunk_id"),
-                "rerank_score": d["score"],
+                "rerank_score": None if advanced is not None and not rerank_enabled else d["score"],
                 "faiss_rank": d["faiss_rank"],
                 "faiss_index": d["faiss_index"],
                 "faiss_distance": d["faiss_distance"],
@@ -2283,6 +2503,10 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
                 "prompt_injection_risk": injection_check["risk"],
                 "matched_patterns": injection_check["matched_patterns"]
             })
+            if advanced is not None:
+                sources[-1].update({key: doc.metadata.get(key) for key in (
+                    "version", "child_id", "parent_id", "document_version_id", "index_snapshot_id", "page", "start", "end"
+                )})
 
         # 10. 转换成 save_qa_logs() 需要的格式
         db_reranked_results = []
@@ -2296,7 +2520,7 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
                 None,
                 float(d["score"]),
                 0.0,
-                float(d["faiss_distance"]),
+                d["faiss_distance"] if advanced is not None else float(d["faiss_distance"]),
                 doc.metadata.get("source"),
                 doc.metadata.get("chunk_id")
             ])
@@ -2339,7 +2563,7 @@ def _ask_question(request: AskRequest, *, evaluation_options=None, trace=None):
             }
         }
         # 13. 写入 Redis 缓存
-        if not evaluating:
+        if cache_key and not evaluating and _eligible_for_cache(advanced):
             try:
                 current_stage = "cache_write"
                 redis_write_start = time.perf_counter()

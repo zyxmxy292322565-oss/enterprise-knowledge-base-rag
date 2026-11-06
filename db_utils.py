@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from pymysql.connections import Connection
 import json
 
-load_dotenv()
+from isolated_config import require_target, verify_mysql
 
 # 1. 数据库连接
 def get_connection() -> Connection:
@@ -34,7 +34,7 @@ def get_connection() -> Connection:
         当前项目使用的数据库名，比如 rag_demo。
 
     处理流程：
-    1. 使用 load_dotenv() 加载 .env 配置。
+    1. 使用 from isolated_config import require_target, verify_mysql 加载 .env 配置。
     2. 使用 os.getenv() 读取 MySQL 配置。
     3. 使用 pymysql.connect() 创建数据库连接。
     4. 设置 charset="utf8mb4"，保证支持中文。
@@ -45,16 +45,17 @@ def get_connection() -> Connection:
         MySQL 数据库连接对象。
         后续执行 SQL、提交事务、关闭连接都依赖它。
     """
+    require_target("mysql")
     conn = pymysql.connect(
-        host=os.getenv("MYSQL_HOST", "localhost"),
-        port=int(os.getenv("MYSQL_PORT", 3306)),
-        user=os.getenv("MYSQL_USER", "root"),
+        host=os.environ["MYSQL_HOST"],
+        port=int(os.environ["MYSQL_PORT"]),
+        user=os.environ["MYSQL_USER"],
         password=os.getenv("MYSQL_PASSWORD"),
-        database=os.getenv("MYSQL_DATABASE", "rag_demo"),
+        database=os.environ["MYSQL_DATABASE"],
         charset="utf8mb4"
     )
 
-    return conn
+    return verify_mysql(conn)
 
 # 2. 初始化表结构
 def init_db() -> None:
@@ -234,7 +235,7 @@ def save_qa_logs(
             str(item[7]),
             float(item[3]),
             float(item[4]),
-            float(item[5]),
+            float(item[5]) if item[5] is not None else None,
             created_at
         ))
 

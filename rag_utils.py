@@ -40,12 +40,11 @@ def is_noise_line(line: str) -> bool:
     line = line.strip()
 
     if not line:
-        return True
+        return False
 
     noise_patterns = [
         r"^第\s*\d+\s*页$",
         r"^Page\s+\d+$",
-        r"^\d+$",
         r"^[\-—_=·.。]+$",
         r"^公司内部资料$",
         r"^内部资料$",
@@ -59,7 +58,7 @@ def clean_document_text(text: str) -> dict:
     """
     文档清洗：
     1. 统一换行符
-    2. 去除页码、页眉页脚、纯数字等噪声行
+    2. 去除明确页码和页眉页脚，保留段落与数字
     3. 合并 PDF 断行
     4. 压缩多余空行
     5. 返回清洗前后统计信息
@@ -114,7 +113,7 @@ def clean_document_text(text: str) -> dict:
                 buffer = line
             else:
                 # 中文 PDF 断行通常可以直接拼接
-                buffer += line
+                buffer += "\n" + line
 
     if buffer:
         merged_lines.append(buffer.strip())
